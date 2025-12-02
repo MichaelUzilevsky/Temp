@@ -1,0 +1,226 @@
+import logging
+from datetime import datetime, timezone
+from typing import List, Any, Type
+
+from app.application.services.base_service import BaseService
+from app.application.services.timeline_calculator import TimelineCalculator
+from app.db.sql.models.mission import Mission
+from app.domain.exceptions.domain_exception import ResourceUnavailableException, DomainException
+from app.domain.interfaces.repository import IMissionRepository
+from app.domain.interfaces.resource_registry import ResourceRegistry
+from app.domain.schemas.enums import ResourceType
+from app.domain.schemas.mission import MissionCreate, MissionUpdate
+from app.domain.schemas.events import GroupedEventRegister, GroupedEventUpdate
+
+logger = logging.getLogger(__name__)
+
+class MissionService(BaseService[Mission, MissionCreate, MissionUpdate]):
+    def __init__(
+            self,
+            repository: IMissionRepository,
+            timeline_calculator: TimelineCalculator,
+            resource_registry: Type[ResourceRegistry]
+    ):
+        super().__init__(repository)
+        self.mission_repo = repository
+        self.calculator = timeline_calculator
+        self.resource_registry = resource_registry
+
+    # =========================================================================
+    # 1. CREATE MISSION (Metadata + Initial Events)
+    # =========================================================================
+    async def create(self, obj_in: MissionCreate) -> Mission:
+        # 1. Split Data: Metadata vs Initial Events
+        mission_data = obj_in.model_dump(
+            exclude={"initial_stations", "initial_crawlers", "initial_platforms", 
+                     "initial_operators", "initial_links"}
+        )
+        
+        # 2. Check Availability for all initial resources BEFORE creating anything
+        await self._check_list_availability(ResourceType.STATION, obj_in.initial_stations)
+        await self._check_list_availability(ResourceType.CRAWLER, obj_in.initial_crawlers)
+        await self._check_list_availability(ResourceType.PLATFORM, obj_in.initial_platforms)
+        await self._check_list_availability(ResourceType.RT, obj_in.initial_links)
+
+        # 3. Create Mission Metadata in DB
+        mission_obj = Mission(**mission_data)
+        created_mission = await self.mission_repo.create(mission_obj)
+        mission_id = created_mission.id
+
+        # 4. Insert Initial Events
+        initial_payload = GroupedEventRegister(
+            stations=obj_in.initial_stations,
+            crawlers=obj_in.initial_crawlers,
+            platforms=obj_in.initial_platforms,
+            operators=obj_in.initial_operators,
+            links=obj_in.initial_links
+        )
+        # Reuse register logic to keep inserts DRY
+        await self.register_events(mission_id, initial_payload)
+        
+        logger.info(f"Created Mission {mission_id} with initial configuration.")
+        return await self.get(mission_id)
+
+    # =========================================================================
+    # 2. REGISTER EVENTS (Simple Insert)
+    # =========================================================================
+    async def register_events(self, mission_id: int, payload: GroupedEventRegister) -> None:
+        """
+        Inserts new events directly. No timeline shifting/fixing.
+        """
+        await self._process_insert(mission_id, ResourceType.STATION, payload.stations)
+        await self._process_insert(mission_id, ResourceType.CRAWLER, payload.crawlers)
+        await self._process_insert(mission_id, ResourceType.PLATFORM, payload.platforms)
+        await self._process_insert(mission_id, ResourceType.OPERATOR, payload.operators)
+        await self._process_insert(mission_id, ResourceType.RT, payload.links)
+        
+        logger.info(f"Registered new events batch for Mission {mission_id}")
+
+    async def _process_insert(self, mission_id: int, res_type: ResourceType, events: List[Any]):
+        if not events:
+            return
+
+        # 1. Check Availability (Gatekeeper)
+        await self._check_list_availability(res_type, events, exclude_mission_id=mission_id)
+
+        # 2. Convert Schemas -> DB Objects
+        meta = self.resource_registry.get(res_type)
+        db_objects = []
+        for event_schema in events:
+            data = event_schema.model_dump()
+            data["mission_id"] = mission_id
+            db_objects.append(meta.event_model(**data))
+
+        # 3. Save to DB (Insert Only)
+        await self.mission_repo.bulk_update_timeline(
+            events_to_create=db_objects,
+            events_to_update=[],
+            events_to_delete_ids=[],
+            event_model_type=meta.event_model
+        )
+
+    # =========================================================================
+    # 3. UPDATE EVENTS (Complex Timeline Logic)
+    # =========================================================================
+    async def update_events(self, mission_id: int, payload: GroupedEventUpdate) -> None:
+        """
+        Updates timeline with auto-fix logic using the Calculator.
+        """
+        resources = [
+            (ResourceType.STATION, payload.stations, payload.delete_stations),
+            (ResourceType.CRAWLER, payload.crawlers, payload.delete_crawlers),
+            (ResourceType.PLATFORM, payload.platforms, payload.delete_platforms),
+            (ResourceType.OPERATOR, payload.operators, payload.delete_operators),
+            (ResourceType.RT, payload.links, payload.delete_links),
+        ]
+
+        for res_type, updates, deletes in resources:
+            if not updates and not deletes:
+                continue
+                
+            await self._process_timeline_fix(
+                mission_id=mission_id,
+                res_type=res_type,
+                updates=updates,
+                deletes=deletes,
+                auto_fix=payload.auto_fix_gaps
+            )
+            
+        logger.info(f"Updated timeline logic for Mission {mission_id}")
+
+    async def _process_timeline_fix(
+        self, 
+        mission_id: int, 
+        res_type: ResourceType, 
+        updates: List[Any], 
+        deletes: List[int], 
+        auto_fix: bool
+    ):
+        meta = self.resource_registry.get(res_type)
+        
+        # 1. Fetch Current History
+        mission = await self.get(mission_id)
+        
+        # Resolve attribute name dynamically (handle 'links' vs 'mission_rts')
+        attr_name = f"mission_{res_type.value}s"
+        if res_type == ResourceType.RT: 
+            attr_name = "links"
+        
+        if not hasattr(mission, attr_name):
+             raise DomainException(f"Relationship {attr_name} not found on Mission model.")
+        
+        current_events = getattr(mission, attr_name, [])
+
+        # 2. Check Availability for updates that change times/resources
+        await self._check_list_availability(res_type, updates, exclude_mission_id=mission_id)
+
+        # 3. Calculator Factory
+        def schema_to_model_factory(schema):
+            data = schema.model_dump()
+            data["mission_id"] = mission_id
+            return meta.event_model(**data)
+
+        # 4. Calculate Logic
+        plan = self.calculator.calculate_changes(
+            current_events=list(current_events),
+            updates=updates,
+            creates=[], # No mixed creates in update endpoint
+            deletes=deletes,
+            auto_fix=auto_fix,
+            model_factory=schema_to_model_factory
+        )
+
+        # 5. Persist
+        await self.mission_repo.bulk_update_timeline(
+            events_to_create=plan.to_create,
+            events_to_update=plan.to_update,
+            events_to_delete_ids=plan.to_delete_ids,
+            event_model_type=meta.event_model
+        )
+
+    # =========================================================================
+    # HELPERS
+    # =========================================================================
+    async def _check_list_availability(
+        self, 
+        res_type: ResourceType, 
+        events: List[Any], 
+        exclude_mission_id: int = None
+    ):
+        meta = self.resource_registry.get(res_type)
+        
+        for event in events:
+            # 1. Get Resource ID
+            res_id = getattr(event, meta.fk_field, None)
+            
+            # If update payload doesn't contain ID (e.g. only time change), we skip check
+            # Realistically, changing time of an existing resource SHOULD check availability,
+            # but without the ID in the payload, we'd need to fetch the original event first.
+            # Assuming payload contains the FK if it's changing or if it's new.
+            if not res_id:
+                continue 
+
+            # 2. Get Times (Safety against missing attributes)
+            start = getattr(event, "start_time", None)
+            if start is None:
+                # If start_time isn't provided (partial update), skip check? 
+                # Or assume we need to fetch original. 
+                # For 'Register', start_time is mandatory. For 'Update', it might be partial.
+                continue
+
+            # Handle Open-Ended events (end_time=None -> Infinity)
+            end_val = getattr(event, "end_time", None)
+            if end_val is None:
+                end_val = datetime.max.replace(tzinfo=timezone.utc)
+
+            # 3. Call Repo
+            conflicts = await self.mission_repo.check_resource_availability(
+                resource_type=res_type,
+                resource_id=res_id,
+                start=start,
+                end=end_val,
+                exclude_mission_id=exclude_mission_id
+            )
+            
+            if conflicts:
+                raise ResourceUnavailableException(f"Resource {res_type.value} {res_id} is busy.")
