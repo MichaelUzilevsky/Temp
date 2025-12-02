@@ -1,0 +1,104 @@
+from typing import List
+
+from fastapi import APIRouter, Depends, status, Path, Query
+
+from app.api.dependencies import get_mission_service
+from app.application.services.mission_service import MissionService
+from app.domain.schemas import mission as mission_schemas
+from app.domain.schemas import events as event_schemas
+
+router = APIRouter(prefix="/missions", tags=["Missions"])
+
+# =========================================================================
+# 1. CREATE MISSION (Metadata + Initial Events)
+# =========================================================================
+@router.post("", response_model=mission_schemas.MissionRead, status_code=status.HTTP_201_CREATED)
+async def create_mission(
+    payload: mission_schemas.MissionCreate,
+    service: MissionService = Depends(get_mission_service)
+):
+    """
+    Creates a new mission.
+    Can optionally include initial configuration (Stations, Crawlers, etc.) 
+    which will be validated for availability immediately.
+    """
+    return await service.create(payload)
+
+# =========================================================================
+# 2. GET MISSION (Full Timeline)
+# =========================================================================
+@router.get("/{id}", response_model=mission_schemas.MissionRead)
+async def get_mission(
+    id: int = Path(..., description="The ID of the mission to retrieve"),
+    service: MissionService = Depends(get_mission_service)
+):
+    """
+    Retrieves a single mission by ID, including its full timeline history 
+    (Stations, Crawlers, Platforms, Operators, RT Links).
+    """
+    return await service.get(id)
+
+# =========================================================================
+# 3. GET MANY MISSIONS
+# =========================================================================
+@router.get("", response_model=List[mission_schemas.MissionRead])
+async def get_missions(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=1000),
+    service: MissionService = Depends(get_mission_service)
+):
+    """
+    Retrieves a paginated list of missions.
+    """
+    return await service.get_multi(skip, limit)
+
+# =========================================================================
+# 4. DELETE MISSION
+# =========================================================================
+@router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_mission(
+    id: int = Path(..., description="The ID of the mission to delete"),
+    service: MissionService = Depends(get_mission_service)
+):
+    """
+    Deletes a mission and all its associated timeline events.
+    """
+    await service.delete(id)
+
+# =========================================================================
+# 5. REGISTER EVENTS (Insert New)
+# =========================================================================
+@router.post("/{id}/events", status_code=status.HTTP_201_CREATED)
+async def register_events(
+    payload: event_schemas.GroupedEventRegister,
+    id: int = Path(..., description="Mission ID"),
+    service: MissionService = Depends(get_mission_service)
+):
+    """
+    Registers NEW events for the mission resources.
+    Use this to append to the timeline (e.g. "We just switched to Station 5").
+    Does NOT perform timeline shifting/fixing logic.
+    """
+    await service.register_events(id, payload)
+    return {"message": "Events registered successfully"}
+
+# =========================================================================
+# 6. UPDATE EVENTS (Timeline Fix / Time Travel)
+# =========================================================================
+@router.patch("/{id}/events", status_code=status.HTTP_200_OK)
+async def update_events(
+    payload: event_schemas.GroupedEventUpdate,
+    id: int = Path(..., description="Mission ID"),
+    service: MissionService = Depends(get_mission_service)
+):
+    """
+    Updates EXISTING events or fixes the timeline.
+    Use this for retroactive corrections (e.g. "Actually, Station 5 started 10 mins ago").
+    
+    Features:
+    - Splits updates per resource type.
+    - Handles deletions if delete lists are provided.
+    - Runs the Timeline Calculator to auto-fix gaps and overlaps if `auto_fix_gaps` is True.
+    """
+    await service.update_events(id, payload)
+    return {"message": "Timeline updated successfully"}
